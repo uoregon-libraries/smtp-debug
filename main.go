@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -11,13 +12,17 @@ import (
 )
 
 func main() {
-	var listener, err = net.Listen("tcp", ":25")
+	var port = flag.Int("port", 25, "The port to listen on for SMTP connections")
+	flag.Parse()
+
+	var addr = fmt.Sprintf(":%d", *port)
+	var listener, err = net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatal("Failed to listen on port 25:", err)
+		log.Fatalf("Failed to listen on port %d: %v", *port, err)
 	}
 	defer listener.Close()
 
-	fmt.Println("RAW SMTP Debug Server listening on port 25...")
+	fmt.Printf("RAW SMTP Debug Server listening on port %d...\n", *port)
 	fmt.Println("Logging ALL raw SMTP traffic - no parsing, just pure data")
 	fmt.Println("Press Ctrl+C to stop")
 	fmt.Println(strings.Repeat("=", 70))
