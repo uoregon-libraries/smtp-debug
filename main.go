@@ -81,7 +81,7 @@ func handleRawConnection(conn net.Conn, connID int) {
 			response = "250 OK\r\n"
 		} else if strings.HasPrefix(trimmedLine, "RCPT TO:") {
 			response = "250 OK\r\n"
-		} else if trimmedLine == "DATA" {
+		} else if strings.HasPrefix(trimmedLine, "DATA") {
 			response = "354 End data with <CR><LF>.<CR><LF>\r\n"
 		} else if trimmedLine == "." {
 			response = "250 OK: Message accepted\r\n"
