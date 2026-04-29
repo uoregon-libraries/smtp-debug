@@ -54,7 +54,7 @@ func TestWriteMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeMessage: %v", err)
 	}
-	if got := filepath.Base(path); got != "2026-04-27_13-05-05_conn7_msg1.txt" {
+	if got := filepath.Base(path); got != "2026-04-27_13-05-05_conn7_msg1.html" {
 		t.Errorf("filename = %q", got)
 	}
 
@@ -64,19 +64,24 @@ func TestWriteMessage(t *testing.T) {
 	}
 	var got = string(data)
 
+	var wantTitle = "Hello | Alice &lt;alice@example.com&gt; - Bob &lt;bob@example.com&gt; | SMTP Logs"
 	var wantSubstrings = []string{
-		"=== Envelope ===",
-		"Connection: 7 from 10.0.0.5:12345",
-		"MAIL FROM:  alice@example.com",
-		"RCPT TO:    bob@example.com, carol@example.com",
-		"=== Headers ===",
-		"From: Alice <alice@example.com>",
-		"To: Bob <bob@example.com>",
-		"Subject: Hello",
-		"Message-Id: <abc@example.com>",
-		"--- Other headers ---",
-		"X-Custom: weird",
-		"=== Body ===",
+		"<!DOCTYPE html>",
+		`<html lang="en">`,
+		"<title>" + wantTitle + "</title>",
+		"<h1>" + wantTitle + "</h1>",
+		"<h2>Envelope</h2>",
+		"<dt>Connection</dt><dd>7 from 10.0.0.5:12345</dd>",
+		"<dt>MAIL FROM</dt><dd>alice@example.com</dd>",
+		"<dt>RCPT TO</dt><dd>bob@example.com, carol@example.com</dd>",
+		"<h2>Headers</h2>",
+		"<dt>From</dt><dd>Alice &lt;alice@example.com&gt;</dd>",
+		"<dt>To</dt><dd>Bob &lt;bob@example.com&gt;</dd>",
+		"<dt>Subject</dt><dd>Hello</dd>",
+		"<dt>Message-Id</dt><dd>&lt;abc@example.com&gt;</dd>",
+		"<h2>Other headers</h2>",
+		"<dt>X-Custom</dt><dd>weird</dd>",
+		"<h2>Body</h2>",
 		"Body line one.",
 		"Body line two.",
 	}
@@ -87,8 +92,87 @@ func TestWriteMessage(t *testing.T) {
 	}
 
 	// Headers section should appear before Body section.
-	if i, j := strings.Index(got, "=== Headers ==="), strings.Index(got, "=== Body ==="); i < 0 || j < 0 || i > j {
+	if i, j := strings.Index(got, "<h2>Headers</h2>"), strings.Index(got, "<h2>Body</h2>"); i < 0 || j < 0 || i > j {
 		t.Errorf("header/body order wrong: headers=%d body=%d", i, j)
+	}
+}
+
+func TestWriteMessage_HTMLBody(t *testing.T) {
+	var dir = t.TempDir()
+	var sess = &session{
+		connID:     1,
+		clientAddr: "127.0.0.1:1",
+		mailFrom:   "alice@example.com",
+		rcptTos:    []string{"bob@example.com"},
+		dataLines: []string{
+			"From: Alice <alice@example.com>",
+			"To: Bob <bob@example.com>",
+			"Subject: HTML mail",
+			"Content-Type: text/html; charset=utf-8",
+			"",
+			`<p>Hello, <strong>world</strong>.</p>`,
+		},
+		msgSeq: 1,
+	}
+	var path, err = writeMessage(dir, sess, time.Now())
+	if err != nil {
+		t.Fatalf("writeMessage: %v", err)
+	}
+	var data, _ = os.ReadFile(path)
+	var got = string(data)
+
+	if !strings.Contains(got, `<iframe sandbox srcdoc="`) {
+		t.Errorf("expected sandboxed iframe for HTML body:\n%s", got)
+	}
+	// The email's HTML must be attribute-escaped inside srcdoc, not emitted raw.
+	if strings.Contains(got, `<p>Hello, <strong>world</strong>.</p>`) {
+		t.Errorf("raw email HTML leaked outside srcdoc:\n%s", got)
+	}
+	if !strings.Contains(got, `&lt;p&gt;Hello, &lt;strong&gt;world&lt;/strong&gt;.&lt;/p&gt;`) {
+		t.Errorf("expected escaped HTML inside srcdoc:\n%s", got)
+	}
+}
+
+func TestWriteMessage_MultipartAlternative(t *testing.T) {
+	var dir = t.TempDir()
+	var body = strings.Join([]string{
+		"--BOUND",
+		"Content-Type: text/plain; charset=utf-8",
+		"",
+		"plain version",
+		"--BOUND",
+		"Content-Type: text/html; charset=utf-8",
+		"",
+		"<p>html version</p>",
+		"--BOUND--",
+	}, "\r\n")
+	var sess = &session{
+		connID:     1,
+		clientAddr: "127.0.0.1:1",
+		mailFrom:   "alice@example.com",
+		rcptTos:    []string{"bob@example.com"},
+		dataLines: []string{
+			"From: Alice <alice@example.com>",
+			"To: Bob <bob@example.com>",
+			"Subject: Mixed",
+			`Content-Type: multipart/alternative; boundary="BOUND"`,
+			"",
+			body,
+		},
+		msgSeq: 1,
+	}
+	var path, err = writeMessage(dir, sess, time.Now())
+	if err != nil {
+		t.Fatalf("writeMessage: %v", err)
+	}
+	var data, _ = os.ReadFile(path)
+	var got = string(data)
+
+	if !strings.Contains(got, "&lt;p&gt;html version&lt;/p&gt;") {
+		t.Errorf("expected HTML alternative to win:\n%s", got)
+	}
+	if strings.Contains(got, "plain version") {
+		t.Errorf("plain alternative should not appear when HTML is available:\n%s", got)
 	}
 }
 
@@ -190,11 +274,11 @@ func TestHandleRawConnection_FullSession(t *testing.T) {
 	}
 
 	// Check the first message: dot-stuffing must be undone, envelope captured.
-	var first = mustReadFileContaining(t, dir, "Subject: First")
-	if !strings.Contains(first, "MAIL FROM:  alice@example.com") {
+	var first = mustReadFileContaining(t, dir, "<dt>Subject</dt><dd>First</dd>")
+	if !strings.Contains(first, "<dt>MAIL FROM</dt><dd>alice@example.com</dd>") {
 		t.Errorf("first message envelope wrong:\n%s", first)
 	}
-	if !strings.Contains(first, "RCPT TO:    bob@example.com, carol@example.com") {
+	if !strings.Contains(first, "<dt>RCPT TO</dt><dd>bob@example.com, carol@example.com</dd>") {
 		t.Errorf("first message recipients wrong:\n%s", first)
 	}
 	if !strings.Contains(first, ".dot-stuffed line") {
@@ -205,11 +289,11 @@ func TestHandleRawConnection_FullSession(t *testing.T) {
 	}
 
 	// Check the second message: envelope must reflect the post-RSET state.
-	var second = mustReadFileContaining(t, dir, "Subject: Second")
-	if !strings.Contains(second, "MAIL FROM:  carol@example.com") {
+	var second = mustReadFileContaining(t, dir, "<dt>Subject</dt><dd>Second</dd>")
+	if !strings.Contains(second, "<dt>MAIL FROM</dt><dd>carol@example.com</dd>") {
 		t.Errorf("second message envelope wrong:\n%s", second)
 	}
-	if !strings.Contains(second, "RCPT TO:    dave@example.com") {
+	if !strings.Contains(second, "<dt>RCPT TO</dt><dd>dave@example.com</dd>") {
 		t.Errorf("second message recipients wrong:\n%s", second)
 	}
 	if strings.Contains(second, "alice@example.com") || strings.Contains(second, "bob@example.com") {

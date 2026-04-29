@@ -2,15 +2,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/base64"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"log/slog"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -197,11 +204,11 @@ func extractAddr(s string) string {
 	return s
 }
 
-// writeMessage writes a human-readable rendering of the captured message to
+// writeMessage writes a semantic HTML rendering of the captured message to
 // outdir. It returns the path written.
 func writeMessage(outdir string, sess *session, received time.Time) (string, error) {
 	var stamp = received.Format("2006-01-02_15-04-05")
-	var name = fmt.Sprintf("%s_conn%d_msg%d.txt", stamp, sess.connID, sess.msgSeq)
+	var name = fmt.Sprintf("%s_conn%d_msg%d.html", stamp, sess.connID, sess.msgSeq)
 	var path = filepath.Join(outdir, name)
 
 	var raw = strings.Join(sess.dataLines, "\r\n")
@@ -209,38 +216,86 @@ func writeMessage(outdir string, sess *session, received time.Time) (string, err
 		raw += "\r\n"
 	}
 
-	var buf strings.Builder
-	fmt.Fprintln(&buf, "=== Envelope ===")
-	fmt.Fprintf(&buf, "Received:   %s\n", received.Format(time.RFC3339))
-	fmt.Fprintf(&buf, "Connection: %d from %s\n", sess.connID, sess.clientAddr)
-	fmt.Fprintf(&buf, "MAIL FROM:  %s\n", sess.mailFrom)
-	if len(sess.rcptTos) == 0 {
-		fmt.Fprintln(&buf, "RCPT TO:    (none)")
-	} else {
-		fmt.Fprintf(&buf, "RCPT TO:    %s\n", strings.Join(sess.rcptTos, ", "))
-	}
-	buf.WriteString("\n")
-
 	var msg, parseErr = mail.ReadMessage(strings.NewReader(raw))
+
+	var title string
 	if parseErr != nil {
-		fmt.Fprintln(&buf, "=== Raw message (header parse failed) ===")
-		fmt.Fprintln(&buf, parseErr.Error())
-		buf.WriteString("\n")
-		buf.WriteString(raw)
+		title = "(unparsed message) | SMTP Logs"
+	} else {
+		var dec = new(mime.WordDecoder)
+		var decode = func(s string) string {
+			if d, err := dec.DecodeHeader(s); err == nil {
+				return d
+			}
+			return s
+		}
+		var subj = decode(firstOr(msg.Header["Subject"], "(no subject)"))
+		var from = decode(firstOr(msg.Header["From"], "(unknown sender)"))
+		var to = decode(firstOr(msg.Header["To"], "(unknown recipient)"))
+		title = fmt.Sprintf("%s | %s - %s | SMTP Logs", subj, from, to)
+	}
+
+	var buf strings.Builder
+	writePageStart(&buf, title)
+	writeEnvelope(&buf, sess, received)
+
+	if parseErr != nil {
+		fmt.Fprintln(&buf, `<section>`)
+		fmt.Fprintln(&buf, `<h2>Raw message (header parse failed)</h2>`)
+		fmt.Fprintf(&buf, "<p>%s</p>\n", html.EscapeString(parseErr.Error()))
+		fmt.Fprintf(&buf, "<pre>%s</pre>\n", html.EscapeString(raw))
+		fmt.Fprintln(&buf, `</section>`)
 	} else {
 		writeHeaders(&buf, msg.Header)
-		buf.WriteString("\n=== Body ===\n")
-		var body, _ = io.ReadAll(msg.Body)
-		buf.Write(body)
-		if len(body) > 0 && body[len(body)-1] != '\n' {
-			buf.WriteString("\n")
-		}
+		writeBody(&buf, msg)
 	}
+
+	writePageEnd(&buf)
 
 	if err := os.WriteFile(path, []byte(buf.String()), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func firstOr(vals []string, fallback string) string {
+	if len(vals) == 0 {
+		return fallback
+	}
+	return vals[0]
+}
+
+func writePageStart(buf *strings.Builder, title string) {
+	var esc = html.EscapeString(title)
+	fmt.Fprintln(buf, "<!DOCTYPE html>")
+	fmt.Fprintln(buf, `<html lang="en">`)
+	fmt.Fprintln(buf, "<head>")
+	fmt.Fprintln(buf, `<meta charset="utf-8">`)
+	fmt.Fprintf(buf, "<title>%s</title>\n", esc)
+	fmt.Fprintln(buf, "</head>")
+	fmt.Fprintln(buf, "<body>")
+	fmt.Fprintf(buf, "<h1>%s</h1>\n", esc)
+}
+
+func writePageEnd(buf *strings.Builder) {
+	fmt.Fprintln(buf, "</body>")
+	fmt.Fprintln(buf, "</html>")
+}
+
+func writeEnvelope(buf *strings.Builder, sess *session, received time.Time) {
+	fmt.Fprintln(buf, `<section>`)
+	fmt.Fprintln(buf, `<h2>Envelope</h2>`)
+	fmt.Fprintln(buf, `<dl>`)
+	fmt.Fprintf(buf, "<dt>Received</dt><dd>%s</dd>\n", html.EscapeString(received.Format(time.RFC3339)))
+	fmt.Fprintf(buf, "<dt>Connection</dt><dd>%d from %s</dd>\n", sess.connID, html.EscapeString(sess.clientAddr))
+	fmt.Fprintf(buf, "<dt>MAIL FROM</dt><dd>%s</dd>\n", html.EscapeString(sess.mailFrom))
+	if len(sess.rcptTos) == 0 {
+		fmt.Fprintln(buf, `<dt>RCPT TO</dt><dd>(none)</dd>`)
+	} else {
+		fmt.Fprintf(buf, "<dt>RCPT TO</dt><dd>%s</dd>\n", html.EscapeString(strings.Join(sess.rcptTos, ", ")))
+	}
+	fmt.Fprintln(buf, `</dl>`)
+	fmt.Fprintln(buf, `</section>`)
 }
 
 // writeHeaders prints common headers first in a readable order, then any
@@ -250,13 +305,17 @@ func writeHeaders(buf *strings.Builder, h mail.Header) {
 	var primary = []string{"From", "To", "Cc", "Bcc", "Reply-To", "Subject", "Date", "Message-Id"}
 	var seen = make(map[string]bool, len(primary))
 
-	fmt.Fprintln(buf, "=== Headers ===")
+	fmt.Fprintln(buf, `<section>`)
+	fmt.Fprintln(buf, `<h2>Headers</h2>`)
+	fmt.Fprintln(buf, `<dl>`)
 	for _, k := range primary {
 		seen[k] = true
 		for _, v := range h[k] {
-			fmt.Fprintf(buf, "%s: %s\n", k, v)
+			fmt.Fprintf(buf, "<dt>%s</dt><dd>%s</dd>\n", html.EscapeString(k), html.EscapeString(v))
 		}
 	}
+	fmt.Fprintln(buf, `</dl>`)
+	fmt.Fprintln(buf, `</section>`)
 
 	var rest []string
 	for k := range h {
@@ -265,11 +324,104 @@ func writeHeaders(buf *strings.Builder, h mail.Header) {
 		}
 	}
 	if len(rest) > 0 {
-		buf.WriteString("\n--- Other headers ---\n")
+		sort.Strings(rest)
+		fmt.Fprintln(buf, `<section>`)
+		fmt.Fprintln(buf, `<h2>Other headers</h2>`)
+		fmt.Fprintln(buf, `<dl>`)
 		for _, k := range rest {
 			for _, v := range h[k] {
-				fmt.Fprintf(buf, "%s: %s\n", k, v)
+				fmt.Fprintf(buf, "<dt>%s</dt><dd>%s</dd>\n", html.EscapeString(k), html.EscapeString(v))
 			}
 		}
+		fmt.Fprintln(buf, `</dl>`)
+		fmt.Fprintln(buf, `</section>`)
 	}
+}
+
+// writeBody renders the message body. If it's HTML (directly or via
+// multipart/alternative), it's embedded in a sandboxed iframe so the email's
+// markup can't collide with the surrounding page. Plain text falls back to a
+// <pre> block.
+func writeBody(buf *strings.Builder, msg *mail.Message) {
+	fmt.Fprintln(buf, `<section>`)
+	fmt.Fprintln(buf, `<h2>Body</h2>`)
+
+	var body, _ = io.ReadAll(msg.Body)
+	var ct = msg.Header.Get("Content-Type")
+	var cte = msg.Header.Get("Content-Transfer-Encoding")
+	var mediaType, params, _ = mime.ParseMediaType(ct)
+
+	switch {
+	case strings.HasPrefix(mediaType, "multipart/"):
+		renderMultipart(buf, body, params["boundary"])
+	case mediaType == "text/html":
+		renderHTML(buf, decodeBody(body, cte))
+	default:
+		renderText(buf, decodeBody(body, cte))
+	}
+
+	fmt.Fprintln(buf, `</section>`)
+}
+
+func renderMultipart(buf *strings.Builder, body []byte, boundary string) {
+	var htmlPart, textPart []byte
+	walkMultipart(body, boundary, &htmlPart, &textPart)
+	switch {
+	case htmlPart != nil:
+		renderHTML(buf, htmlPart)
+	case textPart != nil:
+		renderText(buf, textPart)
+	default:
+		renderText(buf, body)
+	}
+}
+
+func walkMultipart(body []byte, boundary string, htmlPart, textPart *[]byte) {
+	if boundary == "" {
+		return
+	}
+	var mr = multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		var part, err = mr.NextPart()
+		if err != nil {
+			return
+		}
+		var partBody, _ = io.ReadAll(part)
+		var ct = part.Header.Get("Content-Type")
+		var cte = part.Header.Get("Content-Transfer-Encoding")
+		var mt, params, _ = mime.ParseMediaType(ct)
+		switch {
+		case strings.HasPrefix(mt, "multipart/"):
+			walkMultipart(partBody, params["boundary"], htmlPart, textPart)
+		case mt == "text/html" && *htmlPart == nil:
+			*htmlPart = decodeBody(partBody, cte)
+		case mt == "text/plain" && *textPart == nil:
+			*textPart = decodeBody(partBody, cte)
+		}
+	}
+}
+
+func decodeBody(body []byte, cte string) []byte {
+	switch strings.ToLower(strings.TrimSpace(cte)) {
+	case "quoted-printable":
+		if d, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(body))); err == nil {
+			return d
+		}
+	case "base64":
+		if d, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(body))); err == nil {
+			return d
+		}
+	}
+	return body
+}
+
+func renderHTML(buf *strings.Builder, body []byte) {
+	fmt.Fprintf(buf,
+		`<iframe sandbox srcdoc="%s" title="Email body" style="width:100%%;min-height:600px;border:1px solid #ccc"></iframe>`+"\n",
+		html.EscapeString(string(body)),
+	)
+}
+
+func renderText(buf *strings.Builder, body []byte) {
+	fmt.Fprintf(buf, "<pre>%s</pre>\n", html.EscapeString(string(body)))
 }
