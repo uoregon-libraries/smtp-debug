@@ -8,7 +8,7 @@ exclusively by Claude Code.
 Everything lives in `cmd/smtp-debug/main.go` as `package main`. There is no
 library layer, there are no internal packages. It's super simple and arguably
 still overengineered (putting the app under `cmd` was my idea, not AI's, and I
-don't know think I can defend that decision).
+don't think I can defend that decision).
 
 This project seems like kind of a terrible idea, but for us it's been very
 handy to test emails in staging environments where end users need to verify
